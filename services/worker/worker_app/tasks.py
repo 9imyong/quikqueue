@@ -1,12 +1,14 @@
 import asyncio
 import logging
 import os
+from datetime import timedelta
 
 import aiohttp
 from celery import shared_task
+from sqlalchemy import select
 
 from .db import SessionLocal
-from .models import JobResult
+from .models import JobResult, utcnow
 
 log = logging.getLogger(__name__)
 
@@ -15,6 +17,11 @@ EXTERNAL_API = os.getenv("EXTERNAL_API", "https://httpbin.org/get")
 EXTERNAL_API_TIMEOUT_SECONDS = float(os.getenv("EXTERNAL_API_TIMEOUT_SECONDS", "10"))
 if EXTERNAL_API_TIMEOUT_SECONDS <= 0:
     raise ValueError("EXTERNAL_API_TIMEOUT_SECONDS must be positive")
+
+# API는 DB 커밋과 Kafka 발행을 각각 수행한다. 발행이 실패하면 QUEUED 행만
+# 남으므로, 일정 시간 움직임이 없는 행은 주기적으로 다시 큐에 넣는다.
+STALE_JOB_SECONDS = float(os.getenv("STALE_JOB_SECONDS", "300"))
+STALE_JOB_BATCH = int(os.getenv("STALE_JOB_BATCH", "100"))
 
 MAX_RETRIES = int(os.getenv("TASK_MAX_RETRIES", "3"))
 RETRY_BACKOFF_SECONDS = float(os.getenv("TASK_RETRY_BACKOFF_SECONDS", "5"))
@@ -113,6 +120,37 @@ def process_job(self, payload: dict):
         raise
 
     return _record(job_id, "DONE", f"Fetched {len(content)} bytes")
+
+
+@shared_task(name="worker_app.tasks.requeue_stale_jobs")
+def requeue_stale_jobs():
+    """Kafka 발행 실패 등으로 멈춰 있는 QUEUED 작업을 다시 큐에 넣는다.
+
+    상태는 QUEUED 그대로 두고 updated_at만 갱신한다. 재발행한 실행이 또
+    실패해도 STALE_JOB_SECONDS 뒤에 다시 잡히므로 스스로 복구된다.
+    """
+    cutoff = utcnow() - timedelta(seconds=STALE_JOB_SECONDS)
+    db = SessionLocal()
+    try:
+        rows = db.scalars(
+            select(JobResult)
+            .where(JobResult.status == "QUEUED", JobResult.updated_at < cutoff)
+            .order_by(JobResult.updated_at)
+            .limit(STALE_JOB_BATCH)
+        ).all()
+        payloads = [{"id": row.id, "text": row.input_text} for row in rows]
+        for row in rows:
+            row.updated_at = utcnow()  # 다음 주기까지 같은 행을 다시 잡지 않도록
+            db.add(row)
+        db.commit()
+    finally:
+        db.close()
+
+    for payload in payloads:
+        process_job.apply_async(args=[payload])
+    if payloads:
+        log.warning("requeued %s stale job(s)", len(payloads))
+    return {"requeued": len(payloads)}
 
 
 @shared_task(name="worker_app.tasks.heartbeat")

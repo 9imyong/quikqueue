@@ -20,12 +20,19 @@ celery_app.conf.update(
     enable_utc=True,
 )
 
-# Beat 스케줄 예시 (1분마다 더미 태스크)
+STALE_JOB_SWEEP_SECONDS = float(os.getenv("STALE_JOB_SWEEP_SECONDS", "60"))
+
 celery_app.conf.beat_schedule = {
+    # 간단한 생존 확인
     "heartbeat-every-60s": {
         "task": "worker_app.tasks.heartbeat",
         "schedule": 60.0,
-    }
+    },
+    # DB에는 남았지만 큐로 넘어가지 못한 작업 복구
+    "requeue-stale-jobs": {
+        "task": "worker_app.tasks.requeue_stale_jobs",
+        "schedule": STALE_JOB_SWEEP_SECONDS,
+    },
 }
 
 
