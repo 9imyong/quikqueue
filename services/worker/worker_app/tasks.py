@@ -1,10 +1,24 @@
 import os
+import asyncio
 import aiohttp
 from celery import shared_task
 from .db import SessionLocal, init_db
 from .models import JobResult
 
 EXTERNAL_API = os.getenv("EXTERNAL_API", "https://httpbin.org/get")
+
+EXTERNAL_API_TIMEOUT_SECONDS = float(os.getenv("EXTERNAL_API_TIMEOUT_SECONDS", "10"))
+if EXTERNAL_API_TIMEOUT_SECONDS <= 0:
+    raise ValueError("EXTERNAL_API_TIMEOUT_SECONDS must be positive")
+
+
+async def fetch_external(text: str):
+    timeout = aiohttp.ClientTimeout(total=EXTERNAL_API_TIMEOUT_SECONDS)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(EXTERNAL_API, params={"q": text}) as response:
+            response.raise_for_status()
+            return await response.read()
+
 
 @shared_task(name="worker_app.tasks.process_job")
 def process_job(payload: dict):
@@ -17,19 +31,13 @@ def process_job(payload: dict):
     job_id = payload["id"]
     text = payload.get("text", "")
 
-    # aiohttp는 비동기이므로 Celery 동기 태스크 안에서는 간단히 run_until_complete
-    import asyncio
-    async def fetch():
-        async with aiohttp.ClientSession() as session:
-            async with session.get(EXTERNAL_API, params={"q": text}) as resp:
-                return await resp.text()
-
     try:
-        content = asyncio.run(fetch())
+        content = asyncio.run(fetch_external(text))
         note = f"Fetched {len(content)} bytes"
         status = "DONE"
-    except Exception as e:
-        note = f"ERROR: {e}"
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        # Avoid storing URLs, query text or unbounded exception messages.
+        note = f"ERROR: {type(e).__name__}"
         status = "FAILED"
 
     db = SessionLocal()

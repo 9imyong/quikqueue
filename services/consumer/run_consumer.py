@@ -1,5 +1,6 @@
 # services/consumer/run_consumer.py
 import os, asyncio, json
+import logging
 from aiokafka import AIOKafkaConsumer
 from aiokafka.errors import KafkaConnectionError
 from celery import Celery
@@ -34,7 +35,10 @@ async def main():
     try:
         async for msg in consumer:
             payload = json.loads(msg.value.decode("utf-8"))
-            task = "worker_app.tasks.process_job" if payload.get("type") != "ai" else "worker_app.tasks.ai_analyze"
+            if payload.get("type", "process_job") != "process_job":
+                logging.error("Unsupported job type at partition=%s offset=%s", msg.partition, msg.offset)
+                continue
+            task = "worker_app.tasks.process_job"
             celery_app.send_task(task, args=[payload])
     finally:
         await consumer.stop()

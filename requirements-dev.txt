@@ -1,0 +1,3 @@
+-r services/api/requirements.txt
+-r services/worker/requirements.txt
+httpx==0.27.2
