@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / 'services/api'), str(ROOT / 'services/worker')]
 
 import aiohttp
+from celery.exceptions import Retry
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -94,25 +95,91 @@ class ProducerTests(unittest.IsolatedAsyncioTestCase):
 
 
 class WorkerTests(unittest.TestCase):
+    """process_job은 bind=True라 request 컨텍스트를 직접 넣고 run()을 호출한다."""
+
+    def setUp(self):
+        self.addCleanup(tasks.process_job.pop_request)
+
+    def run_task(self, payload, retries=0):
+        tasks.process_job.push_request(retries=retries)
+        return tasks.process_job.run(payload)
+
+    def test_rejects_payload_without_integer_id(self):
+        for payload in [{}, {'id': '1'}, {'id': True}]:
+            with self.subTest(payload=payload), self.assertRaises(ValueError):
+                self.run_task(payload)
+                tasks.process_job.pop_request()
+            tasks.process_job.push_request(retries=0)
+
     def test_success_counts_bytes(self):
-        row, db = MagicMock(), MagicMock()
+        row, db = MagicMock(status='QUEUED'), MagicMock()
         db.get.return_value = row
-        with patch.object(tasks, 'init_db'), patch.object(tasks, 'SessionLocal', return_value=db), patch.object(tasks, 'fetch_external', new_callable=AsyncMock, return_value='한'.encode()):
-            result = tasks.process_job.run({'id': 1, 'text': 'hello'})
+        with patch.object(tasks, 'SessionLocal', return_value=db), \
+             patch.object(tasks, 'fetch_external', new_callable=AsyncMock, return_value='한'.encode()):
+            result = self.run_task({'id': 1, 'text': 'hello'})
         self.assertEqual(result['status'], 'DONE')
+        self.assertEqual(row.status, 'DONE')
         self.assertEqual(row.note, 'Fetched 3 bytes')
         db.commit.assert_called_once()
+        db.close.assert_called()
 
-    def test_http_error_and_timeout_mark_failed(self):
+    def test_already_done_skips_external_call(self):
+        db = MagicMock()
+        db.get.return_value = MagicMock(status='DONE')
+        with patch.object(tasks, 'SessionLocal', return_value=db), \
+             patch.object(tasks, 'fetch_external', new_callable=AsyncMock) as fetch:
+            result = self.run_task({'id': 1, 'text': 'hello'})
+        fetch.assert_not_awaited()
+        self.assertTrue(result['skipped'])
+        db.commit.assert_not_called()
+
+    def test_missing_row_retries_without_inserting(self):
+        db = MagicMock()
+        db.get.return_value = None
+        with patch.object(tasks, 'SessionLocal', return_value=db), \
+             patch.object(tasks.process_job, 'retry', side_effect=Retry()) as retry:
+            with self.assertRaises(Retry):
+                self.run_task({'id': 42, 'text': 'x'})
+        db.add.assert_not_called()
+        self.assertIsInstance(retry.call_args.kwargs['exc'], tasks.MissingJobRow)
+
+    def test_transient_error_retries_with_backoff(self):
+        row, db = MagicMock(status='QUEUED'), MagicMock()
+        db.get.return_value = row
+        with patch.object(tasks, 'SessionLocal', return_value=db), \
+             patch.object(tasks, 'fetch_external', new_callable=AsyncMock, side_effect=asyncio.TimeoutError()), \
+             patch.object(tasks.process_job, 'retry', side_effect=Retry()) as retry:
+            with self.assertRaises(Retry):
+                self.run_task({'id': 1}, retries=1)
+        self.assertEqual(retry.call_args.kwargs['countdown'], tasks.RETRY_BACKOFF_SECONDS * 2)
+        db.commit.assert_not_called()
+
+    def test_http_error_and_timeout_mark_failed_after_last_retry(self):
         for error in [aiohttp.ClientResponseError(None, (), status=500), asyncio.TimeoutError()]:
             with self.subTest(error=type(error).__name__):
-                row, db = MagicMock(), MagicMock()
+                row, db = MagicMock(status='QUEUED'), MagicMock()
                 db.get.return_value = row
-                with patch.object(tasks, 'init_db'), patch.object(tasks, 'SessionLocal', return_value=db), patch.object(tasks, 'fetch_external', new_callable=AsyncMock, side_effect=error):
-                    self.assertEqual(tasks.process_job.run({'id': 1})['status'], 'FAILED')
+                with patch.object(tasks, 'SessionLocal', return_value=db), \
+                     patch.object(tasks, 'fetch_external', new_callable=AsyncMock, side_effect=error):
+                    result = self.run_task({'id': 1}, retries=tasks.MAX_RETRIES)
+                self.assertEqual(result['status'], 'FAILED')
                 self.assertEqual(row.status, 'FAILED')
+                self.assertEqual(row.note, 'ERROR: ' + type(error).__name__)
                 db.commit.assert_called_once()
-                db.close.assert_called_once()
+                db.close.assert_called()
+                tasks.process_job.pop_request()
+            tasks.process_job.push_request(retries=0)
+
+    def test_unexpected_error_is_recorded_then_raised(self):
+        row, db = MagicMock(status='QUEUED'), MagicMock()
+        db.get.return_value = row
+        with patch.object(tasks, 'SessionLocal', return_value=db), \
+             patch.object(tasks, 'fetch_external', new_callable=AsyncMock, side_effect=ZeroDivisionError()):
+            with self.assertRaises(ZeroDivisionError):
+                self.run_task({'id': 1})
+        self.assertEqual(row.status, 'FAILED')
+        self.assertEqual(row.note, 'ERROR: ZeroDivisionError')
+        db.commit.assert_called_once()
 
 
 class HttpTests(unittest.IsolatedAsyncioTestCase):

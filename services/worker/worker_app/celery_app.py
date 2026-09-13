@@ -1,5 +1,10 @@
+import logging
 import os
+
 from celery import Celery
+from celery.signals import worker_process_init
+
+from .db import init_db
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 RESULT_DB = os.getenv("CELERY_RESULT_DB_URI")  # db+mysql+pymysql://...
@@ -23,7 +28,12 @@ celery_app.conf.beat_schedule = {
     }
 }
 
-# ... 기존 celery_app 정의 및 beat_schedule 아래에 추가
-from . import tasks  # <- tasks 모듈 명시적으로 import하여 태스크 등록
-# 또는 아래 방식도 가능:
-# celery_app.autodiscover_tasks(['worker_app'])
+
+@worker_process_init.connect
+def _create_tables(**_):
+    """스키마 준비는 워커 프로세스 기동 시 한 번만. 태스크마다 DDL을 확인하지 않는다."""
+    init_db()
+    logging.getLogger(__name__).info("schema ready")
+
+
+from . import tasks  # noqa: E402  <- tasks 모듈 명시적으로 import하여 태스크 등록
