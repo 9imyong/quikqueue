@@ -3,7 +3,6 @@ services:
     image: bitnami/kafka:3.7
     container_name: kafka
     environment:
-      - KAFKA_ENABLE_KRAFT=yes
       - KAFKA_CFG_PROCESS_ROLES=broker,controller
       - KAFKA_CFG_NODE_ID=1
       - KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER
@@ -16,6 +15,7 @@ services:
       - KAFKA_CFG_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1
       - KAFKA_CFG_TRANSACTION_STATE_LOG_MIN_ISR=1
       - KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE=true
+      - KAFKA_CFG_NUM_PARTITIONS=3          # 컨슈머를 늘리면 병렬 처리되도록
       - KAFKA_CFG_LOG_DIRS=/bitnami/kafka/data
       - ALLOW_PLAINTEXT_LISTENER=yes
     ports:
@@ -58,8 +58,17 @@ services:
 
   redis:
     image: redis:7
+    # Celery 브로커. 영속화가 없으면 재시작 시 대기 중인 작업이 사라진다.
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
     ports:
       - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
   api:
     build:
@@ -71,8 +80,15 @@ services:
       kafka:
         condition: service_healthy
     env_file: .env
+    restart: unless-stopped
     ports:
       - "127.0.0.1:8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/').read()"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
 
 
   consumer:
@@ -83,26 +99,34 @@ services:
       kafka:
         condition: service_healthy      # ✅ Kafka healthy 후 시작
       redis:
-        condition: service_started
+        condition: service_healthy
     env_file: .env
-    restart: unless-stopped             # ✅ 실패해도 자동 재시작
+    # 전달 실패 시 오프셋을 커밋하지 않고 종료하므로, 재시작이 곧 재처리다.
+    restart: unless-stopped
 
 
   worker:
     build: ./services/worker
     depends_on:
-      - redis
-      - mysql
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     env_file: .env
+    restart: unless-stopped
 
   beat:
     build: ./services/worker
     command: ["celery", "-A", "worker_app.celery_app", "beat", "-l", "info"]
     depends_on:
-      - worker
-      - redis
+      redis:
+        condition: service_healthy
+      worker:
+        condition: service_started
     env_file: .env
+    restart: unless-stopped
 
 volumes:
   mysql_data:
   kafka_data:
+  redis_data:
